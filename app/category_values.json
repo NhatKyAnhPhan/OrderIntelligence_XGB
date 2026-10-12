@@ -1,0 +1,105 @@
+{
+  "is_weekend": [
+    "No",
+    "Yes"
+  ],
+  "gender": [
+    "Female",
+    "Male"
+  ],
+  "customer_segment": [
+    "Premium",
+    "Regular",
+    "VIP"
+  ],
+  "category": [
+    "Clothing",
+    "Electronics",
+    "Health",
+    "Home",
+    "Sports"
+  ],
+  "sub_category": [
+    "Accessories",
+    "Appliances",
+    "Audio",
+    "Bedding",
+    "Cameras",
+    "Decor",
+    "Fitness",
+    "Furniture",
+    "Gym Equipment",
+    "Kids Wear",
+    "Kitchen",
+    "Laptops",
+    "Medical Devices",
+    "Mens Wear",
+    "Outdoor",
+    "Personal Care",
+    "Shoes",
+    "Smartphones",
+    "Sports Wear",
+    "Supplements",
+    "Tablets",
+    "Womens Wear"
+  ],
+  "brand": [
+    "Adidas",
+    "Anker",
+    "Apple",
+    "Asus",
+    "Baseus",
+    "Canon",
+    "Dell",
+    "Fitbit",
+    "GoPro",
+    "HP",
+    "Huawei",
+    "JBL",
+    "Lenovo",
+    "Logitech",
+    "Nike",
+    "Nikon",
+    "Philips",
+    "Samsung",
+    "Sony",
+    "Xiaomi"
+  ],
+  "shipping_method": [
+    "Economy",
+    "Express",
+    "Next Day",
+    "Standard"
+  ],
+  "payment_method": [
+    "Apple Pay",
+    "Bank Transfer",
+    "Credit Card",
+    "Debit Card",
+    "PayPal"
+  ],
+  "installment_plan": [
+    "No",
+    "Yes"
+  ],
+  "campaign_source": [
+    "Affiliate",
+    "Email",
+    "Facebook",
+    "Google Ads",
+    "Instagram",
+    "Organic"
+  ],
+  "device_type": [
+    "Desktop",
+    "Mobile",
+    "Tablet"
+  ],
+  "traffic_source": [
+    "Direct",
+    "Email",
+    "Referral",
+    "Search",
+    "Social"
+  ]
+}

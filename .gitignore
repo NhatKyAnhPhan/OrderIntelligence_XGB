@@ -1,0 +1,12 @@
+# Bỏ qua môi trường ảo
+.venv/
+__pycache__/
+
+# Bỏ qua thư mục chứa dataset và kết quả train
+ecommerce_500m/
+results/
+
+# Các tệp mô hình đã train (nếu có đuôi .pkl, .h5, .joblib, v.v.)
+*.pkl
+*.h5
+*.joblib
