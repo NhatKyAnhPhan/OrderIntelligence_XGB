@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from datetime import date, time
 from pathlib import Path
 
@@ -13,17 +15,33 @@ from app.predictor import (
     CATEGORICAL_FEATURES,
     build_feature_vector,
     load_categories,
+    load_category_indexer,
     load_model,
+    load_spark_tree_model,
     predict_price,
+    predict_spark_price,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL_PATH = ROOT / "results" / "full_500m" / "xgboost" / "model_xgboost.ubj"
-METRICS_PATH = ROOT / "results" / "full_500m" / "xgboost" / "metrics.json"
-IMPORTANCE_PATH = (
-    ROOT / "results" / "full_500m" / "xgboost" / "feature_importance.json"
-)
+RESULTS_DIR = ROOT / "results" / "full_500m"
 CATEGORIES_PATH = Path(__file__).resolve().parent / "category_values.json"
+MODEL_CONFIGS = {
+    "random_forest": {
+        "label": "Random Forest",
+        "directory": RESULTS_DIR / "random_forest",
+        "kind": "spark",
+    },
+    "gbt": {
+        "label": "GBT",
+        "directory": RESULTS_DIR / "gbt",
+        "kind": "spark",
+    },
+    "xgboost": {
+        "label": "XGBoost",
+        "directory": RESULTS_DIR / "xgboost",
+        "kind": "xgboost",
+    },
+}
 
 CATEGORY_LABELS = {
     "gender": "Giới tính",
@@ -312,25 +330,79 @@ st.markdown(
         <p class="hero-eyebrow">E-commerce · Machine learning</p>
         <h1>Order Intelligence</h1>
         <p class="hero-copy">
-            Ước tính giá trị đơn hàng với mô hình XGBoost được huấn luyện
-            trên 500 triệu giao dịch thương mại điện tử.
+            So sánh dự đoán giá trị đơn hàng từ Random Forest, GBT và XGBoost,
+            được huấn luyện trên 500 triệu giao dịch thương mại điện tử.
         </p>
-        <span class="hero-chip">✦ &nbsp; XGBoost · 500M giao dịch</span>
+        <span class="hero-chip">✦ &nbsp; Random Forest · GBT · XGBoost</span>
     </section>
     """,
     unsafe_allow_html=True,
 )
 
-for required_path, label in (
-    (MODEL_PATH, "model XGBoost"),
-    (METRICS_PATH, "chỉ số đánh giá"),
-    (IMPORTANCE_PATH, "feature importance"),
-    (CATEGORIES_PATH, "danh mục mã hóa"),
-):
-    if not required_path.is_file():
-        st.error(f"Không tìm thấy {label}: `{required_path}`")
-        st.info("Xem `app/README.md` để biết cấu trúc file và cách khởi chạy.")
-        st.stop()
+if not CATEGORIES_PATH.is_file():
+    st.error(f"Không tìm thấy danh mục mã hóa: `{CATEGORIES_PATH}`")
+    st.info("Xem `app/README.md` để biết cấu trúc file và cách khởi chạy.")
+    st.stop()
+
+
+def model_artifact_path(model_key: str) -> Path:
+    config = MODEL_CONFIGS[model_key]
+    if config["kind"] == "xgboost":
+        return config["directory"] / "model_xgboost.ubj"
+    return config["directory"] / "model"
+
+
+def model_is_available(model_key: str) -> bool:
+    config = MODEL_CONFIGS[model_key]
+    if not model_artifact_path(model_key).exists():
+        return False
+    if config["kind"] == "spark":
+        return (config["directory"] / "category_indexer.json").is_file()
+    return True
+
+
+def configure_spark_environment():
+    if os.name != "nt":
+        return
+
+    hadoop_home = os.environ.get("HADOOP_HOME") or os.environ.get("hadoop.home.dir")
+    if not hadoop_home:
+        default_home = Path("C:/hadoop")
+        if (default_home / "bin" / "winutils.exe").is_file():
+            hadoop_home = str(default_home)
+    if not hadoop_home or not (Path(hadoop_home) / "bin" / "winutils.exe").is_file():
+        raise RuntimeError(
+            "Dự đoán bằng Random Forest/GBT trên Windows cần HADOOP_HOME trỏ "
+            "đến thư mục Hadoop có bin\\winutils.exe."
+        )
+
+    os.environ.setdefault("HADOOP_HOME", hadoop_home)
+    os.environ.setdefault("hadoop.home.dir", hadoop_home)
+    hadoop_bin = str(Path(hadoop_home) / "bin")
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if hadoop_bin.casefold() not in {entry.casefold() for entry in path_entries}:
+        os.environ["PATH"] = hadoop_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+AVAILABLE_MODELS = [
+    key for key in MODEL_CONFIGS if model_is_available(key)
+]
+UNAVAILABLE_MODELS = [
+    key for key in MODEL_CONFIGS if not model_is_available(key)
+]
+
+if UNAVAILABLE_MODELS:
+    unavailable_labels = ", ".join(
+        MODEL_CONFIGS[key]["label"] for key in UNAVAILABLE_MODELS
+    )
+    st.warning(
+        f"Chưa thể dự đoán bằng {unavailable_labels}: thiếu model hoặc mapping "
+        "categorical lưu cùng model. Hãy train lại các model Spark bằng "
+        "`train_all_500m.py` để tạo mapping chính xác."
+    )
+if not AVAILABLE_MODELS:
+    st.error("Không có model nào sẵn sàng để dự đoán.")
+    st.stop()
 
 
 @st.cache_resource
@@ -338,38 +410,103 @@ def get_model(model_path: str):
     return load_model(Path(model_path))
 
 
+@st.cache_resource
+def get_spark_model(model_path: str, model_type: str):
+    configure_spark_environment()
+    get_spark_session()
+    return load_spark_tree_model(Path(model_path), model_type)
+
+
+@st.cache_resource
+def get_spark_session():
+    from pyspark.sql import SparkSession
+
+    configure_spark_environment()
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+    spark = (
+        SparkSession.builder.master("local[*]")
+        .appName("OrderIntelligenceInference")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+
 @st.cache_data
 def get_categories(categories_path: str):
     return load_categories(Path(categories_path))
 
 
-with METRICS_PATH.open(encoding="utf-8") as metrics_file:
-    metrics = json.load(metrics_file)
-with IMPORTANCE_PATH.open(encoding="utf-8") as importance_file:
-    feature_importance = json.load(importance_file)
+@st.cache_data
+def get_category_orders(mapping_path: str):
+    return load_category_indexer(Path(mapping_path))
+
+
+metrics_by_model = {}
+importance_by_model = {}
+for model_key, config in MODEL_CONFIGS.items():
+    metrics_path = config["directory"] / "metrics.json"
+    importance_path = config["directory"] / "feature_importance.json"
+    if metrics_path.is_file():
+        with metrics_path.open(encoding="utf-8") as metrics_file:
+            metrics_by_model[model_key] = json.load(metrics_file)
+    if importance_path.is_file():
+        with importance_path.open(encoding="utf-8") as importance_file:
+            importance_by_model[model_key] = json.load(importance_file)
 
 st.markdown('<p class="section-kicker">Hiệu suất mô hình</p>', unsafe_allow_html=True)
-metric_columns = st.columns([1.05, 1.55, 1, 1])
-metric_columns[0].metric("Model", metrics["model"])
-metric_columns[1].metric("Dữ liệu huấn luyện", f'{metrics["rows"] / 1_000_000:.0f} triệu dòng')
-metric_columns[2].metric("Sai số trung bình (MAE)", f'${metrics["mae"]:,.2f}')
-metric_columns[3].metric("Độ phù hợp (R²)", f'{metrics["r2"]:.4f}')
-st.markdown(
-    f'<p class="model-note">RMSE trên tập kiểm tra: '
-    f'<strong>${metrics["rmse"]:,.2f} USD</strong>'
-    ' &nbsp;·&nbsp; Kết quả thực tế có thể thay đổi tùy dữ liệu đầu vào.</p>',
-    unsafe_allow_html=True,
-)
+if metrics_by_model:
+    metric_rows = []
+    for model_key, metrics in metrics_by_model.items():
+        metric_rows.append(
+            {
+                "Mô hình": MODEL_CONFIGS[model_key]["label"],
+                "Dữ liệu": f'{metrics["rows"] / 1_000_000:.0f} triệu dòng',
+                "MAE (USD)": metrics["mae"],
+                "RMSE (USD)": metrics["rmse"],
+                "R²": metrics["r2"],
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(metric_rows).set_index("Mô hình"),
+        use_container_width=True,
+    )
+    st.markdown(
+        '<p class="model-note">Chỉ số đánh giá trên tập kiểm tra; kết quả thực tế '
+        'có thể thay đổi tùy dữ liệu đầu vào.</p>',
+        unsafe_allow_html=True,
+    )
 
 categories = get_categories(str(CATEGORIES_PATH))
-model = get_model(str(MODEL_PATH))
 
 with st.form("prediction_form"):
     st.markdown('<h2 class="form-title">Tạo dự đoán</h2>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="form-description">Nhập các thông tin bên dưới để ước tính '
-        'tổng giá trị đơn hàng.</p>',
+        '<p class="form-description">Chọn một hoặc nhiều mô hình, sau đó nhập '
+        'thông tin để so sánh tổng giá trị đơn hàng dự đoán.</p>',
         unsafe_allow_html=True,
+    )
+    st.markdown("**Mô hình dự đoán** · Có thể chọn nhiều mô hình")
+    if UNAVAILABLE_MODELS:
+        available_labels = ", ".join(
+            MODEL_CONFIGS[key]["label"] for key in AVAILABLE_MODELS
+        )
+        unavailable_labels = ", ".join(
+            MODEL_CONFIGS[key]["label"] for key in UNAVAILABLE_MODELS
+        )
+        st.info(
+            f"Hiện chỉ chọn được {available_labels}. "
+            f"{unavailable_labels} sẽ xuất hiện sau khi train lại để lưu mapping "
+            "categorical chính xác."
+        )
+    selected_models = st.multiselect(
+        "Chọn mô hình",
+        options=AVAILABLE_MODELS,
+        default=AVAILABLE_MODELS,
+        format_func=lambda key: MODEL_CONFIGS[key]["label"],
+        placeholder="Chọn một hoặc nhiều mô hình",
+        label_visibility="collapsed",
     )
     order_column, customer_column, product_column = st.columns([1, 1, 1.12])
 
@@ -451,7 +588,7 @@ with st.form("prediction_form"):
             )
 
     submitted = st.form_submit_button(
-        "Dự đoán tổng giá trị đơn hàng",
+        "Dự đoán bằng mô hình đã chọn",
         type="primary",
         use_container_width=True,
     )
@@ -476,29 +613,59 @@ if submitted:
         "delivery_days": delivery_days,
     }
     try:
-        feature_vector = build_feature_vector(
-            numeric_values,
-            categorical_values,
-            categories,
-        )
-        prediction = predict_price(model, feature_vector)
-    except ValueError as error:
+        if not selected_models:
+            raise ValueError("Hãy chọn ít nhất một mô hình.")
+        predictions = {}
+        for model_key in selected_models:
+            config = MODEL_CONFIGS[model_key]
+            category_orders = None
+            if config["kind"] == "spark":
+                mapping_path = config["directory"] / "category_indexer.json"
+                category_orders = get_category_orders(str(mapping_path))
+            feature_vector = build_feature_vector(
+                numeric_values,
+                categorical_values,
+                categories,
+                category_orders,
+            )
+            model_path = model_artifact_path(model_key)
+            if config["kind"] == "xgboost":
+                model = get_model(str(model_path))
+                predictions[model_key] = predict_price(model, feature_vector)
+            else:
+                model = get_spark_model(str(model_path), model_key)
+                predictions[model_key] = predict_spark_price(
+                    model,
+                    feature_vector,
+                    get_spark_session(),
+                )
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
         st.error(f"Không thể dự đoán: {error}")
     else:
+        prediction_columns = st.columns(len(predictions))
+        for column, model_key in zip(prediction_columns, predictions):
+            column.metric(
+                f'Dự đoán · {MODEL_CONFIGS[model_key]["label"]}',
+                f'${predictions[model_key]:,.2f} USD',
+            )
         st.markdown(
-            f'<section class="prediction-card">'
-            f'<p class="prediction-label">TỔNG GIÁ TRỊ ĐƠN HÀNG ƯỚC TÍNH</p>'
-            f'<p class="prediction-value">${prediction:,.2f} USD</p>'
-            f'<p class="prediction-footnote">Đây là kết quả ước tính từ mô hình; '
-            f'giá trị thực tế có thể khác.</p></section>',
+            '<p class="model-note">Các giá trị là dự đoán độc lập của từng mô hình; '
+            'giá trị thực tế có thể khác.</p>',
             unsafe_allow_html=True,
         )
 
-with st.expander("Độ quan trọng của các đặc trưng"):
-    top_features = sorted(
-        feature_importance.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )[:10]
-    importance_frame = pd.DataFrame(top_features, columns=["Đặc trưng", "Mức độ"])
-    st.bar_chart(importance_frame.set_index("Đặc trưng"))
+if importance_by_model:
+    importance_model = st.selectbox(
+        "Xem độ quan trọng của mô hình",
+        options=list(importance_by_model),
+        format_func=lambda key: MODEL_CONFIGS[key]["label"],
+    )
+    with st.expander("Độ quan trọng của các đặc trưng"):
+        feature_importance = importance_by_model[importance_model]
+        top_features = sorted(
+            feature_importance.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:10]
+        importance_frame = pd.DataFrame(top_features, columns=["Đặc trưng", "Mức độ"])
+        st.bar_chart(importance_frame.set_index("Đặc trưng"))

@@ -41,6 +41,33 @@ class BuildFeatureVectorTests(unittest.TestCase):
                 self.categories,
             )
 
+    def test_uses_model_specific_string_indexer_order(self):
+        category_orders = {
+            name: ["beta", "alpha"] for name in CATEGORICAL_FEATURES
+        }
+        features = build_feature_vector(
+            self.numeric_values,
+            self.categorical_values,
+            self.categories,
+            category_orders,
+        )
+
+        np.testing.assert_array_equal(features[16:], np.zeros(12, dtype=np.float32))
+
+    def test_maps_unseen_spark_category_to_keep_bucket(self):
+        category_orders = {
+            name: ["alpha", "beta"] for name in CATEGORICAL_FEATURES
+        }
+        self.categorical_values["gender"] = "unseen"
+        features = build_feature_vector(
+            self.numeric_values,
+            self.categorical_values,
+            self.categories,
+            category_orders,
+        )
+
+        self.assertEqual(features[17], 2.0)
+
     def test_rejects_missing_features(self):
         del self.numeric_values["age"]
 

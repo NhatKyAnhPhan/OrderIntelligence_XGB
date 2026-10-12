@@ -146,6 +146,11 @@ def parse_args():
     p.add_argument("--sample", type=float, default=1.0, help="ti le dong de chay thu (1.0 = toan bo)")
     p.add_argument("--expect-rows", type=int, default=0, help="neu >0, dung lai khi tong dong khac gia tri nay")
     p.add_argument("--only-preflight", action="store_true", help="chi kiem tra du lieu roi dung")
+    p.add_argument(
+        "--rebuild-category-indexers",
+        action="store_true",
+        help="chi tao mapping categorical cho model RF/GBT hien co, khong train model",
+    )
     # Spark
     p.add_argument("--driver-memory", default="20g")
     p.add_argument("--cores", default="8", help="so nhan cho Spark (giam neu bi OOM)")
@@ -258,11 +263,12 @@ def build_spark(a, name):
     return spark
 
 
-def load_split(spark, a):
+def load_split(spark, a, columns=None):
     from pyspark.sql import functions as F
+    columns = columns or [*NUM, *CAT, TARGET]
     df = (
         spark.read.option("recursiveFileLookup", "true").option("pathGlobFilter", "*.parquet")
-        .parquet(a.input).select(ID, *NUM, *CAT, TARGET)
+        .parquet(a.input).select(ID, *columns)
     )
     df = df.withColumn("_h", F.pmod(F.xxhash64(F.col(ID)), F.lit(BUCKETS)))
     if a.sample < 1.0:
@@ -279,6 +285,62 @@ def load_split(spark, a):
     train = df.filter(~is_test).drop(ID, "_h").coalesce(max(cores * 4, n_train // 2_000_000))
     test = df.filter(is_test).drop(ID, "_h").coalesce(max(cores * 4, n_test // 2_000_000))
     return train, test, n_all, n_test
+
+
+def rebuild_category_indexers(a, models, out_root):
+    from pyspark.ml.feature import StringIndexer
+
+    spark = build_spark(a, "rebuild_category_indexers")
+    try:
+        for model_key in models:
+            if model_key not in ("rf", "gbt"):
+                continue
+            out_dir = out_root / MODEL_DIRS[model_key]
+            model_path = out_dir / "model"
+            params_path = out_dir / "model_parameters.json"
+            if not model_path.is_dir() or not params_path.is_file():
+                raise FileNotFoundError(
+                    f"Khong tim thay model va model_parameters.json cua "
+                    f"{MODEL_LABELS[model_key]} trong {out_dir}"
+                )
+
+            with params_path.open(encoding="utf-8") as params_file:
+                params = json.load(params_file)
+            if params.get("split") != "hash(order_id) 80/20":
+                raise ValueError(
+                    f"Khong the xac nhan cach chia tap cua {MODEL_LABELS[model_key]}; "
+                    "chi ho tro model train bang hash(order_id) 80/20."
+                )
+            if float(params.get("sample_fraction", 1.0)) != a.sample:
+                raise ValueError(
+                    f"sample_fraction cua {MODEL_LABELS[model_key]} la "
+                    f"{params.get('sample_fraction')}, khac --sample={a.sample}."
+                )
+
+        log("Doc order_id va 12 cot categorical, ap dung lai split hash 80/20")
+        train, _test, n_all, n_test = load_split(spark, a, columns=CAT)
+        log(
+            f"Fit lai StringIndexer tren tap train ({n_all - n_test:,} dong); "
+            "khong fit lai cay RF/GBT"
+        )
+        indexer = StringIndexer(
+            inputCols=CAT,
+            outputCols=[f"{column}_idx" for column in CAT],
+            handleInvalid="keep",
+        ).fit(train)
+        category_orders = {
+            column: list(labels)
+            for column, labels in zip(CAT, indexer.labelsArray)
+        }
+
+        for model_key in models:
+            if model_key not in ("rf", "gbt"):
+                continue
+            out_dir = out_root / MODEL_DIRS[model_key]
+            write_json(out_dir / "category_indexer.json", category_orders)
+            log(f"Da luu mapping categorical cho {MODEL_LABELS[model_key]}: {out_dir}")
+    finally:
+        spark.stop()
 
 
 def run_spark_model(key, a, out_dir):
@@ -346,6 +408,13 @@ def run_spark_model(key, a, out_dir):
         if not a.no_save_model:
             try:
                 model.write().overwrite().save(str(out_dir / "model"))
+                write_json(
+                    out_dir / "category_indexer.json",
+                    {
+                        column: list(labels)
+                        for column, labels in zip(CAT, prep.stages[0].labelsArray)
+                    },
+                )
             except Exception as e:  # tren Windows co the loi winutils; ket qua da luu o tren
                 log(f"  Khong luu duoc model Spark (bo qua): {repr(e)[:150]}")
     finally:
@@ -601,6 +670,14 @@ def main():
 
     preflight(a)
     if a.only_preflight:
+        return
+    if a.rebuild_category_indexers:
+        spark_models = [m for m in models if m in ("rf", "gbt")]
+        if not spark_models:
+            raise SystemExit(
+                "--rebuild-category-indexers can it nhat mot model: rf hoac gbt"
+            )
+        rebuild_category_indexers(a, spark_models, out_root)
         return
 
     if len(models) > 1:
